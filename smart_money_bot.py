@@ -1,13 +1,16 @@
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json"
-}
 import requests
 import time
 import json
 import os
 from datetime import datetime
 from config import *
+
+# ================= GLOBAL HEADERS =================
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json"
+}
 
 # ================= FILE UTILS =================
 
@@ -31,37 +34,63 @@ class SmartMoneyBot:
     def __init__(self):
         self.trades = load_json("trades.json")
         self.stats = load_json("stats.json")
-        self.symbols = self.fetch_top_coins()
+        self.symbols = self.fetch_top_coins() or ["BTC", "ETH"]
         self.clean_trades()
 
     # ================= SAFETY =================
 
     def clean_trades(self):
         for s in list(self.trades.keys()):
-            if "side" not in self.trades[s]:
+            if not isinstance(self.trades[s], dict) or "side" not in self.trades[s]:
                 del self.trades[s]
         save_json("trades.json", self.trades)
 
     # ================= BYBIT MARKET =================
 
     def fetch_top_coins(self):
-        r = requests.get(
-            f"{BYBIT_BASE}/v5/market/tickers",
-            params={"category": "spot"},
-            timeout=15
-        )
-        r.raise_for_status()
-
-        data = r.json()["result"]["list"]
-
-        coins = [
-            x["symbol"].replace("USDT", "")
-            for x in data
-            if x["symbol"].endswith("USDT")
-            and float(x.get("turnover24h", 0)) >= MIN_VOLUME_USDT
+        urls = [
+            "https://api.bybit.com/v5/market/tickers",
+            "https://api.bybit.com/spot/v3/public/quote/ticker/24hr"
         ]
 
-        return coins[:TOP_N_COINS]
+        for url in urls:
+            try:
+                r = requests.get(
+                    url,
+                    params={"category": "spot"} if "v5" in url else {},
+                    headers=HEADERS,
+                    timeout=15
+                )
+
+                if r.status_code != 200:
+                    continue
+
+                data = r.json()
+
+                if "result" in data:
+                    items = data["result"]["list"]
+                    coins = [
+                        x["symbol"].replace("USDT", "")
+                        for x in items
+                        if x["symbol"].endswith("USDT")
+                        and float(x.get("turnover24h", 0)) >= MIN_VOLUME_USDT
+                    ]
+                else:
+                    coins = [
+                        x["symbol"].replace("USDT", "")
+                        for x in data
+                        if x["symbol"].endswith("USDT")
+                    ]
+
+                if coins:
+                    print(f"Loaded {len(coins)} symbols")
+                    return coins[:TOP_N_COINS]
+
+            except Exception as e:
+                print("Symbol fetch error:", e)
+
+        print("⚠ Using fallback symbols")
+        return ["BTC", "ETH", "SOL", "BNB", "XRP"]
 
     def klines(self, symbol):
         r = requests.get(
@@ -72,23 +101,30 @@ class SmartMoneyBot:
                 "interval": KLINE_INTERVAL,
                 "limit": KLINE_LIMIT
             },
+            headers=HEADERS,
             timeout=10
         )
-        r.raise_for_status()
-        return r.json()["result"]["list"]
+        if r.status_code != 200:
+            return []
+        return r.json().get("result", {}).get("list", [])
 
     def price(self, symbol):
         r = requests.get(
             f"{BYBIT_BASE}/v5/market/tickers",
             params={"category": "spot", "symbol": f"{symbol}USDT"},
+            headers=HEADERS,
             timeout=5
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            return None
         return float(r.json()["result"]["list"][0]["lastPrice"])
 
     # ================= INDICATORS =================
 
     def atr(self, kl, length=14):
+        if len(kl) < length + 1:
+            return None
+
         tr = []
         for i in range(1, length):
             h = float(kl[i][2])
@@ -97,32 +133,25 @@ class SmartMoneyBot:
             tr.append(max(h - l, abs(h - pc), abs(l - pc)))
         return sum(tr) / len(tr)
 
-    def bos_choch(self, kl):
+    def bos(self, kl):
         highs = [float(x[2]) for x in kl]
         lows  = [float(x[3]) for x in kl]
         close = float(kl[-1][4])
 
-        rh = max(highs[-STRUCTURE_LOOKBACK:])
-        rl = min(lows[-STRUCTURE_LOOKBACK:])
-
-        if close > rh:
+        if close > max(highs[-STRUCTURE_LOOKBACK:]):
             return "BOS_BUY"
-        if close < rl:
+        if close < min(lows[-STRUCTURE_LOOKBACK:]):
             return "BOS_SELL"
         return None
 
-    def liquidity_sweep(self, kl):
+    def sweep(self, kl):
         highs = [float(x[2]) for x in kl[-LIQUIDITY_LOOKBACK:]]
         lows  = [float(x[3]) for x in kl[-LIQUIDITY_LOOKBACK:]]
-
         last = kl[-1]
-        wick_high = float(last[2])
-        wick_low  = float(last[3])
-        close     = float(last[4])
 
-        if wick_high > max(highs[:-1]) and close < max(highs[:-1]):
+        if float(last[2]) > max(highs[:-1]) and float(last[4]) < max(highs[:-1]):
             return "SWEEP_HIGH_SELL"
-        if wick_low < min(lows[:-1]) and close > min(lows[:-1]):
+        if float(last[3]) < min(lows[:-1]) and float(last[4]) > min(lows[:-1]):
             return "SWEEP_LOW_BUY"
         return None
 
@@ -141,7 +170,7 @@ class SmartMoneyBot:
     # ================= TRADING =================
 
     def open_trade(self, symbol, side, price, atr):
-        if len(self.trades) >= MAX_TRADES:
+        if len(self.trades) >= MAX_TRADES or atr is None:
             return
 
         d = atr * ATR_MULTIPLIER
@@ -150,57 +179,36 @@ class SmartMoneyBot:
             "side": side,
             "entry": price,
             "sl": price - d if side == "BUY" else price + d,
-            "tp1": price + d if side == "BUY" else price - d,
-            "tp2": price + 2*d if side == "BUY" else price - 2*d,
-            "tp3": price + 3*d if side == "BUY" else price - 3*d,
-            "opened": time.time(),
-            "hit": []
+            "tp": price + 2*d if side == "BUY" else price - 2*d,
+            "opened": time.time()
         }
 
         self.send(
             f"🚀 {side} {symbol}\n"
             f"Entry: {price:.4f}\n"
-            f"TP1: {self.trades[symbol]['tp1']:.4f}\n"
-            f"TP2: {self.trades[symbol]['tp2']:.4f}\n"
-            f"TP3: {self.trades[symbol]['tp3']:.4f}\n"
+            f"TP: {self.trades[symbol]['tp']:.4f}\n"
             f"SL: {self.trades[symbol]['sl']:.4f}"
         )
 
-    def close_trade(self, symbol, win, reason):
-        self.send(f"{'✅' if win else '❌'} {reason} {symbol}")
-        stat = self.stats.setdefault(symbol, {"wins": 0, "losses": 0})
-        stat["wins" if win else "losses"] += 1
-        del self.trades[symbol]
-        save_json("stats.json", self.stats)
-
     def manage_trade(self, symbol):
         t = self.trades.get(symbol)
-        if not t:
-            return
-
         price = self.price(symbol)
-        side = t["side"]
+        if not t or price is None:
+            return
 
         if time.time() - t["opened"] < MIN_HOLD_SECONDS:
             return
 
-        def hit(tp):
-            return price >= t[tp] if side == "BUY" else price <= t[tp]
+        side = t["side"]
 
         if (side == "BUY" and price <= t["sl"]) or (side == "SELL" and price >= t["sl"]):
-            self.close_trade(symbol, False, "SL HIT")
+            self.send(f"❌ SL HIT {symbol}")
+            del self.trades[symbol]
             return
 
-        if "tp1" not in t["hit"] and hit("tp1"):
-            t["hit"].append("tp1")
-            self.send(f"🥇 TP1 HIT {symbol}")
-
-        if "tp2" not in t["hit"] and hit("tp2"):
-            t["hit"].append("tp2")
-            self.send(f"🥈 TP2 HIT {symbol}")
-
-        if "tp3" not in t["hit"] and hit("tp3"):
-            self.close_trade(symbol, True, "TP3 HIT")
+        if (side == "BUY" and price >= t["tp"]) or (side == "SELL" and price <= t["tp"]):
+            self.send(f"✅ TP HIT {symbol}")
+            del self.trades[symbol]
 
     # ================= LOOP =================
 
@@ -214,20 +222,18 @@ class SmartMoneyBot:
                         continue
 
                     kl = self.klines(symbol)
-                    bos = self.bos_choch(kl)
-                    sweep = self.liquidity_sweep(kl)
-
-                    if not bos and not sweep:
+                    if len(kl) < 30:
                         continue
 
-                    side = "BUY" if (
-                        (bos and "BUY" in bos) or sweep == "SWEEP_LOW_BUY"
-                    ) else "SELL"
+                    signal = self.bos(kl) or self.sweep(kl)
+                    if not signal:
+                        continue
 
+                    side = "BUY" if "BUY" in signal else "SELL"
                     price = float(kl[-1][4])
                     atr = self.atr(kl)
 
-                    self.send(f"📌 {bos or sweep} {symbol}")
+                    self.send(f"📌 {signal} {symbol}")
                     self.open_trade(symbol, side, price, atr)
 
                 for symbol in list(self.trades.keys()):
@@ -244,4 +250,3 @@ class SmartMoneyBot:
 
 if __name__ == "__main__":
     SmartMoneyBot().run()
-
