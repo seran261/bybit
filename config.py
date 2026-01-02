@@ -8,10 +8,10 @@ TELEGRAM_CHAT_ID  = os.getenv("7951298168")
 BYBIT_BASE = "https://api.bybit.com"
 
 # ================= SCANNER ==================
-TOP_N_COINS = 150
-MIN_VOLUME_USDT = 10_000_000
+TOP_N_COINS = 50                 # keep low for free cloud
+MIN_VOLUME_USDT = 5_000_000
 
-KLINE_INTERVAL = "5"     # 5-minute candles
+KLINE_INTERVAL = "5"             # 5-minute candles
 KLINE_LIMIT = 120
 
 SCAN_INTERVAL_SECONDS = 60
@@ -22,4 +22,4 @@ STRUCTURE_LOOKBACK = 20
 LIQUIDITY_LOOKBACK = 10
 
 ATR_MULTIPLIER = 1.5
-MAX_TRADES = 5
+MAX_TRADES = 3
