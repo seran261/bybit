@@ -1,3 +1,7 @@
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json"
+}
 import requests
 import time
 import json
@@ -240,3 +244,4 @@ class SmartMoneyBot:
 
 if __name__ == "__main__":
     SmartMoneyBot().run()
+
