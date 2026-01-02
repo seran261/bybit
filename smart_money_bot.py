@@ -27,7 +27,7 @@ class SmartMoneyBot:
     def __init__(self):
         self.trades = load_json("trades.json")
         self.symbols = TOP_100_SYMBOLS
-        print(f"🔒 Locked symbols: {len(self.symbols)}")
+        print(f"[INIT] Locked symbols: {len(self.symbols)}")
 
     # ================= BYBIT FUTURES =================
 
@@ -50,34 +50,48 @@ class SmartMoneyBot:
     # ================= INDICATORS =================
 
     def atr(self, kl):
+        if len(kl) < 20:
+            return None
         tr = []
         for i in range(1, 15):
-            h, l, pc = float(kl[i][2]), float(kl[i][3]), float(kl[i-1][4])
+            h = float(kl[i][2])
+            l = float(kl[i][3])
+            pc = float(kl[i-1][4])
             tr.append(max(h-l, abs(h-pc), abs(l-pc)))
-        return sum(tr)/len(tr)
+        return sum(tr) / len(tr)
 
-    def trend(self, kl):
+    def htf_trend(self, kl):
+        highs = [float(x[2]) for x in kl]
+        lows  = [float(x[3]) for x in kl]
         close = float(kl[-1][4])
-        highs = [float(x[2]) for x in kl[-50:]]
-        lows  = [float(x[3]) for x in kl[-50:]]
-        if close > sum(highs)/len(highs): return "BULL"
-        if close < sum(lows)/len(lows):   return "BEAR"
+
+        if close > max(highs[-STRUCTURE_LOOKBACK:]):
+            return "BULL"
+        if close < min(lows[-STRUCTURE_LOOKBACK:]):
+            return "BEAR"
         return "RANGE"
 
     def bos(self, kl):
         highs = [float(x[2]) for x in kl]
         lows  = [float(x[3]) for x in kl]
         close = float(kl[-1][4])
-        if close > max(highs[-STRUCTURE_LOOKBACK:]): return "BUY"
-        if close < min(lows[-STRUCTURE_LOOKBACK:]):  return "SELL"
+
+        if close > max(highs[-STRUCTURE_LOOKBACK:]):
+            return "BUY"
+        if close < min(lows[-STRUCTURE_LOOKBACK:]):
+            return "SELL"
         return None
 
     def sweep(self, kl):
-        h = [float(x[2]) for x in kl[-LIQUIDITY_LOOKBACK:]]
-        l = [float(x[3]) for x in kl[-LIQUIDITY_LOOKBACK:]]
-        c = float(kl[-1][4])
-        if float(kl[-1][2]) > max(h[:-1]) and c < max(h[:-1]): return "SELL"
-        if float(kl[-1][3]) < min(l[:-1]) and c > min(l[:-1]): return "BUY"
+        highs = [float(x[2]) for x in kl[-LIQUIDITY_LOOKBACK:]]
+        lows  = [float(x[3]) for x in kl[-LIQUIDITY_LOOKBACK:]]
+        last = kl[-1]
+        close = float(last[4])
+
+        if float(last[2]) > max(highs[:-1]) and close < max(highs[:-1]):
+            return "SELL"
+        if float(last[3]) < min(lows[:-1]) and close > min(lows[:-1]):
+            return "BUY"
         return None
 
     # ================= TELEGRAM =================
@@ -95,49 +109,66 @@ class SmartMoneyBot:
     # ================= LOOP =================
 
     def run(self):
-        print(f"[{datetime.now()}] 🚀 Bybit Futures Bot Started")
+        print(f"[{datetime.now()}] 🚀 Bybit Futures Smart Money Bot Started")
 
         while True:
             try:
-                for s in self.symbols:
-                    if s in self.trades: continue
+                for sym in self.symbols:
 
-                    ltf = self.klines(s, LTF_INTERVAL)
-                    htf1 = self.klines(s, HTF_1H)
-                    htf4 = self.klines(s, HTF_4H)
-
-                    if len(ltf)<50 or len(htf1)<50 or len(htf4)<50:
+                    # 🔒 symbol lock
+                    if sym in self.trades and time.time() - self.trades[sym] < SYMBOL_LOCK_SECONDS:
                         continue
 
-                    # 🧠 HTF CONFIRMATION
-                    t1, t4 = self.trend(htf1), self.trend(htf4)
-                    if t1 != t4 or t1 == "RANGE":
+                    ltf = self.klines(sym, LTF_INTERVAL)
+                    htf1 = self.klines(sym, HTF_1H)
+                    htf4 = self.klines(sym, HTF_4H)
+
+                    if len(ltf) < 50 or len(htf1) < 50 or len(htf4) < 50:
+                        continue
+
+                    t1 = self.htf_trend(htf1)
+                    t4 = self.htf_trend(htf4)
+
+                    # 🧠 relaxed HTF filter
+                    if t1 == "RANGE" and t4 == "RANGE":
                         continue
 
                     signal = self.bos(ltf) or self.sweep(ltf)
-                    if not signal: continue
+                    if not signal:
+                        continue
 
-                    if (signal=="BUY" and t1!="BULL") or (signal=="SELL" and t1!="BEAR"):
+                    # direction alignment
+                    if signal == "BUY" and t1 == "BEAR":
+                        continue
+                    if signal == "SELL" and t1 == "BULL":
+                        continue
+
+                    atr = self.atr(ltf)
+                    if atr is None:
                         continue
 
                     price = float(ltf[-1][4])
-                    atr = self.atr(ltf)
-                    sl = price - atr*ATR_MULTIPLIER if signal=="BUY" else price + atr*ATR_MULTIPLIER
-                    tp = price + atr*2 if signal=="BUY" else price - atr*2
+                    sl = price - atr * ATR_MULTIPLIER if signal == "BUY" else price + atr * ATR_MULTIPLIER
+                    tp = price + atr * 2 if signal == "BUY" else price - atr * 2
 
-                    self.trades[s] = time.time()
+                    # DEBUG LOG
+                    print(f"{sym} | HTF1={t1} HTF4={t4} | SIGNAL={signal}")
+
+                    self.trades[sym] = time.time()
+                    save_json("trades.json", self.trades)
+
                     self.send(
-                        f"🚀 {signal} {s}USDT\n"
-                        f"HTF: {t1} (1H/4H)\n"
+                        f"🚀 {signal} {sym}USDT (Futures)\n"
+                        f"HTF Bias: 1H={t1}, 4H={t4}\n"
                         f"Entry: {price:.4f}\n"
                         f"TP: {tp:.4f}\n"
                         f"SL: {sl:.4f}"
                     )
 
-                # unlock old trades
-                for k in list(self.trades):
-                    if time.time() - self.trades[k] > 1800:
-                        del self.trades[k]
+                # cleanup old locks
+                for s in list(self.trades):
+                    if time.time() - self.trades[s] > SYMBOL_LOCK_SECONDS:
+                        del self.trades[s]
 
             except Exception as e:
                 print("Runtime error:", e)
