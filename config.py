@@ -5,7 +5,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("8571517277:AAFSulUpC4NIuxZFRrpLHSi9KvGkONFN4SU")
 TELEGRAM_CHAT_ID  = os.getenv("7951298168")
 
 # ================= BYBIT ====================
-BYBIT_BASE = "https://api.bybit.com"
+BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com")
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 
 # ================= SYMBOLS ==================
 TOP_200_SYMBOLS = [
@@ -23,7 +25,7 @@ TOP_200_SYMBOLS = [
 ]
 
 # ================= SCANNING =================
-SYMBOL_BATCH_SIZE = 40       # critical for Railway
+SYMBOL_BATCH_SIZE = 40
 SCAN_INTERVAL_SECONDS = 45
 
 # ================= TIMEFRAMES ===============
@@ -32,9 +34,9 @@ HTF_1H = "60"
 HTF_4H = "240"
 KLINE_LIMIT = 150
 
-# ================= STRATEGY =================
-STRUCTURE_LOOKBACK = 20
-LIQUIDITY_LOOKBACK = 10
+# ================= RISK =====================
+LEVERAGE = 10
+RISK_USDT_PER_TRADE = 10
 
 ATR_MULTIPLIER = 1.5
 TRAIL_ATR_MULT = 1.0
@@ -44,4 +46,5 @@ TP2_R = 2.0
 TP3_R = 3.0
 
 MAX_FUNDING_RATE = 0.02
-SYMBOL_LOCK_SECONDS = 900
+STRUCTURE_LOOKBACK = 20
+LIQUIDITY_LOOKBACK = 10
