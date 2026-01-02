@@ -1,253 +1,240 @@
-import requests, time, json, hmac, hashlib
+import requests
+import time
+import json
+import os
 from datetime import datetime
 from config import *
 
-HEADERS = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+# ================= FILE UTILS =================
 
-# ================= HELPERS =================
+def load_json(path):
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-def now_ms():
-    return str(int(time.time() * 1000))
-
-def sign(payload: str):
-    return hmac.new(
-        BYBIT_API_SECRET.encode(),
-        payload.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-def bybit_public(path, params=None):
-    try:
-        r = requests.get(BYBIT_BASE + path, params=params, headers=HEADERS, timeout=8)
-        return r.json() if r.status_code == 200 else None
-    except Exception as e:
-        print("Public API error:", e)
-        return None
-
-def bybit_private(method, path, body=None):
-    body = body or {}
-    ts = now_ms()
-    recv = "5000"
-    payload = ts + BYBIT_API_KEY + recv + json.dumps(body)
-    sig = sign(payload)
-
-    headers = {
-        **HEADERS,
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-SIGN": sig,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv
-    }
-
-    try:
-        r = requests.request(method, BYBIT_BASE + path, json=body, headers=headers, timeout=10)
-        return r.json()
-    except Exception as e:
-        print("Private API error:", e)
-        return None
-
-def safe_klines(resp):
-    if not resp:
-        return []
-    r = resp.get("result", {})
-    return r.get("list", []) if isinstance(r, dict) else []
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ================= BOT =================
 
 class SmartMoneyBot:
 
     def __init__(self):
-        self.active = set()
-        self.symbols = TOP_200_SYMBOLS
-        self.send("✅ BOT STARTED SUCCESSFULLY\nBybit Smart Money Bot is LIVE 🚀")
-        print(f"[INIT] Symbols loaded: {len(self.symbols)}", flush=True)
+        self.trades = load_json("trades.json")
+        self.stats = load_json("stats.json")
+        self.symbols = self.fetch_top_200()
+        self.clean_trades()
 
-    # ---------- TELEGRAM ----------
+    # ================= SAFETY =================
 
-    def send(self, msg):
-        try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=5
-            )
-            print("Telegram:", r.text)
-        except Exception as e:
-            print("Telegram error:", e)
+    def clean_trades(self):
+        for s in list(self.trades.keys()):
+            t = self.trades[s]
+            if not isinstance(t, dict) or "side" not in t:
+                del self.trades[s]
+        save_json("trades.json", self.trades)
 
-    # ---------- MARKET ----------
+    # ================= MARKET =================
 
-    def klines(self, s, tf):
-        return safe_klines(bybit_public("/v5/market/kline", {
-            "category": "linear",
-            "symbol": f"{s}USDT",
-            "interval": tf,
-            "limit": KLINE_LIMIT
-        }))
+    def fetch_top_200(self):
+        r = requests.get(f"{BINANCE_SPOT_BASE}/ticker/24hr", timeout=15)
+        r.raise_for_status()
+        data = r.json()
 
-    def funding(self, s):
-        d = bybit_public("/v5/market/funding/history", {
-            "category": "linear", "symbol": f"{s}USDT", "limit": 1
-        })
-        try:
-            return abs(float(d["result"]["list"][0]["fundingRate"]))
-        except:
-            return 0.0
+        coins = [
+            x["symbol"].replace("USDT", "")
+            for x in data
+            if x["symbol"].endswith("USDT")
+            and float(x["quoteVolume"]) >= MIN_VOLUME_USDT
+            and not any(b in x["symbol"] for b in ["UP", "DOWN", "BULL", "BEAR"])
+        ]
 
-    def position_open(self, s):
-        r = bybit_private("GET", "/v5/position/list", {
-            "category": "linear",
-            "symbol": f"{s}USDT"
-        })
-        try:
-            return float(r["result"]["list"][0]["size"]) != 0
-        except:
-            return False
+        return coins[:TOP_N_COINS]
 
-    # ---------- LOGIC ----------
+    def klines(self, symbol):
+        r = requests.get(
+            f"{BINANCE_SPOT_BASE}/klines",
+            params={"symbol": f"{symbol}USDT", "interval": KLINE_INTERVAL, "limit": KLINE_LIMIT},
+            timeout=10
+        )
+        r.raise_for_status()
+        return r.json()
 
-    def atr(self, kl):
-        if len(kl) < 20:
-            return None
+    def price(self, symbol):
+        r = requests.get(
+            f"{BINANCE_SPOT_BASE}/ticker/price",
+            params={"symbol": f"{symbol}USDT"},
+            timeout=5
+        )
+        r.raise_for_status()
+        return float(r.json()["price"])
+
+    def atr(self, kl, length=14):
         tr = []
-        for i in range(len(kl) - 14, len(kl)):
+        for i in range(1, length):
             h = float(kl[i][2])
             l = float(kl[i][3])
             pc = float(kl[i - 1][4])
             tr.append(max(h - l, abs(h - pc), abs(l - pc)))
         return sum(tr) / len(tr)
 
-    def trend(self, kl):
-        if len(kl) < STRUCTURE_LOOKBACK:
-            return "RANGE"
-        highs = [float(x[2]) for x in kl[-STRUCTURE_LOOKBACK:]]
-        lows = [float(x[3]) for x in kl[-STRUCTURE_LOOKBACK:]]
-        close = float(kl[-1][4])
-        if close > max(highs): return "BULL"
-        if close < min(lows): return "BEAR"
-        return "RANGE"
+    # ================= SMART MONEY =================
 
-    def signal(self, kl):
-        if len(kl) < STRUCTURE_LOOKBACK:
-            return None
-        highs = [float(x[2]) for x in kl[-STRUCTURE_LOOKBACK:]]
-        lows = [float(x[3]) for x in kl[-STRUCTURE_LOOKBACK:]]
+    def bos_choch(self, kl):
+        highs = [float(x[2]) for x in kl]
+        lows = [float(x[3]) for x in kl]
         close = float(kl[-1][4])
-        if close > max(highs): return "BUY"
-        if close < min(lows): return "SELL"
+
+        rh = max(highs[-STRUCTURE_LOOKBACK:])
+        rl = min(lows[-STRUCTURE_LOOKBACK:])
+        ph = max(highs[-STRUCTURE_LOOKBACK-1:-1])
+        pl = min(lows[-STRUCTURE_LOOKBACK-1:-1])
+
+        if close > rh:
+            return "BOS_BUY"
+        if close < rl:
+            return "BOS_SELL"
+        if close > ph:
+            return "CHOCH_BUY"
+        if close < pl:
+            return "CHOCH_SELL"
         return None
 
-    # ---------- EXECUTION ----------
+    def liquidity_sweep(self, kl):
+        highs = [float(x[2]) for x in kl[-LIQUIDITY_LOOKBACK:]]
+        lows = [float(x[3]) for x in kl[-LIQUIDITY_LOOKBACK:]]
+        last = kl[-1]
 
-    def set_leverage(self, s):
-        bybit_private("POST", "/v5/position/set-leverage", {
-            "category": "linear",
-            "symbol": f"{s}USDT",
-            "buyLeverage": str(LEVERAGE),
-            "sellLeverage": str(LEVERAGE)
-        })
+        eqh = max(highs[:-1])
+        eql = min(lows[:-1])
 
-    def market(self, s, side, qty):
-        bybit_private("POST", "/v5/order/create", {
-            "category": "linear",
-            "symbol": f"{s}USDT",
-            "side": "Buy" if side == "BUY" else "Sell",
-            "orderType": "Market",
-            "qty": str(qty),
-            "positionIdx": 0
-        })
+        wick_high = float(last[2])
+        wick_low = float(last[3])
+        close = float(last[4])
 
-    def limit_reduce(self, s, side, qty, price):
-        bybit_private("POST", "/v5/order/create", {
-            "category": "linear",
-            "symbol": f"{s}USDT",
-            "side": "Sell" if side == "BUY" else "Buy",
-            "orderType": "Limit",
-            "qty": str(round(qty, 3)),
-            "price": str(round(price, 4)),
-            "reduceOnly": True,
-            "timeInForce": "GTC",
-            "positionIdx": 0
-        })
+        if wick_high > eqh and close < eqh:
+            return "SWEEP_HIGH_SELL"
+        if wick_low < eql and close > eql:
+            return "SWEEP_LOW_BUY"
+        return None
 
-    def set_sl(self, s, price):
-        bybit_private("POST", "/v5/position/trading-stop", {
-            "category": "linear",
-            "symbol": f"{s}USDT",
-            "stopLoss": str(round(price, 4)),
-            "slTriggerBy": "LastPrice",
-            "positionIdx": 0
-        })
+    # ================= TELEGRAM =================
 
-    # ---------- LOOP ----------
+    def send(self, msg):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+                timeout=5
+            )
+        except:
+            pass
+
+    # ================= TRADING =================
+
+    def open_trade(self, symbol, side, price, atr):
+        if len(self.trades) >= MAX_TRADES:
+            return
+
+        d = atr * ATR_MULTIPLIER
+
+        self.trades[symbol] = {
+            "side": side,
+            "entry": price,
+            "sl": price - d if side == "BUY" else price + d,
+            "tp1": price + d if side == "BUY" else price - d,
+            "tp2": price + 2*d if side == "BUY" else price - 2*d,
+            "tp3": price + 3*d if side == "BUY" else price - 3*d,
+            "opened": time.time(),
+            "hit": []
+        }
+
+        self.send(
+            f"🚀 {side} {symbol}\n"
+            f"Entry: {price:.4f}\n"
+            f"TP1: {self.trades[symbol]['tp1']:.4f}\n"
+            f"TP2: {self.trades[symbol]['tp2']:.4f}\n"
+            f"TP3: {self.trades[symbol]['tp3']:.4f}\n"
+            f"SL: {self.trades[symbol]['sl']:.4f}"
+        )
+
+    def close_trade(self, symbol, win, reason):
+        self.send(f"{'✅' if win else '❌'} {reason} {symbol}")
+        s = self.stats.setdefault(symbol, {"wins": 0, "losses": 0})
+        s["wins" if win else "losses"] += 1
+        del self.trades[symbol]
+        save_json("stats.json", self.stats)
+
+    def manage_trade(self, symbol):
+        t = self.trades.get(symbol)
+        if not t or "side" not in t:
+            self.trades.pop(symbol, None)
+            return
+
+        side = t["side"]
+        price = self.price(symbol)
+
+        if time.time() - t["opened"] < MIN_HOLD_SECONDS:
+            return
+
+        def hit(tp): 
+            return price >= t[tp] if side == "BUY" else price <= t[tp]
+
+        if (side == "BUY" and price <= t["sl"]) or (side == "SELL" and price >= t["sl"]):
+            self.close_trade(symbol, False, "SL HIT")
+            return
+
+        if "tp1" not in t["hit"] and hit("tp1"):
+            t["hit"].append("tp1")
+            self.send(f"🥇 TP1 HIT {symbol}")
+
+        if "tp1" in t["hit"] and "tp2" not in t["hit"] and hit("tp2"):
+            t["hit"].append("tp2")
+            self.send(f"🥈 TP2 HIT {symbol}")
+
+        if "tp2" in t["hit"] and hit("tp3"):
+            self.close_trade(symbol, True, "TP3 HIT")
+
+    # ================= LOOP =================
 
     def run(self):
-        print("[START] Bot running", flush=True)
+        print(f"[{datetime.now()}] Bot started")
 
         while True:
             try:
-                # Clean finished trades
-                for s in list(self.active):
-                    if not self.position_open(s):
-                        self.active.remove(s)
-
-                self.send("💓 Bot heartbeat OK")
-
-                batch_count = max(1, len(self.symbols) // SYMBOL_BATCH_SIZE)
-                idx = int(time.time() / 300) % batch_count
-                batch = self.symbols[idx * SYMBOL_BATCH_SIZE:(idx + 1) * SYMBOL_BATCH_SIZE]
-
-                for s in batch:
-                    if s in self.active:
+                for symbol in self.symbols:
+                    if symbol in self.trades:
                         continue
 
-                    ltf = self.klines(s, LTF_INTERVAL)
-                    h1 = self.klines(s, HTF_1H)
-                    h4 = self.klines(s, HTF_4H)
+                    kl = self.klines(symbol)
+                    bos = self.bos_choch(kl)
+                    sweep = self.liquidity_sweep(kl)
 
-                    if len(ltf) < 50 or len(h1) < 50 or len(h4) < 50:
+                    if not bos and not sweep:
                         continue
 
-                    if self.funding(s) > MAX_FUNDING_RATE:
-                        continue
+                    side = "BUY" if (
+                        (bos and "BUY" in bos) or sweep == "SWEEP_LOW_BUY"
+                    ) else "SELL"
 
-                    sig = self.signal(ltf)
-                    if not sig:
-                        continue
+                    price = float(kl[-1][4])
+                    atr = self.atr(kl)
 
-                    atr = self.atr(ltf)
-                    if not atr:
-                        continue
+                    self.send(f"📌 {bos or sweep} {symbol}")
+                    self.open_trade(symbol, side, price, atr)
 
-                    price = float(ltf[-1][4])
-                    qty = max(round((RISK_USDT_PER_TRADE * LEVERAGE) / price, 3), 0.01)
+                for symbol in list(self.trades.keys()):
+                    self.manage_trade(symbol)
 
-                    self.set_leverage(s)
-                    self.market(s, sig, qty)
-                    time.sleep(1)
-
-                    sl = price - atr * ATR_MULTIPLIER if sig == "BUY" else price + atr * ATR_MULTIPLIER
-                    tp1 = price + atr * TP1_R if sig == "BUY" else price - atr * TP1_R
-                    tp2 = price + atr * TP2_R if sig == "BUY" else price - atr * TP2_R
-                    tp3 = price + atr * TP3_R if sig == "BUY" else price - atr * TP3_R
-
-                    self.set_sl(s, sl)
-                    self.limit_reduce(s, sig, qty * 0.3, tp1)
-                    self.limit_reduce(s, sig, qty * 0.3, tp2)
-                    self.limit_reduce(s, sig, qty * 0.4, tp3)
-
-                    self.active.add(s)
-
-                    self.send(
-                        f"🔥 LIVE TRADE {sig} {s}USDT\n"
-                        f"Entry: {price:.4f}\n"
-                        f"TP1: {tp1:.4f}\nTP2: {tp2:.4f}\nTP3: {tp3:.4f}\nSL: {sl:.4f}"
-                    )
+                save_json("trades.json", self.trades)
 
             except Exception as e:
-                print("🔥 LOOP ERROR:", e, flush=True)
-                self.send(f"❌ BOT ERROR: {e}")
-                time.sleep(10)
+                print("Runtime error:", e)
 
             time.sleep(SCAN_INTERVAL_SECONDS)
 
